@@ -1,5 +1,3 @@
-# backend/routes/agent.py
-
 import os
 import uuid
 import tempfile
@@ -294,20 +292,139 @@ async def chat(doc_id: str = Form(...), question: str = Form(...), top_k: int = 
 # -----------------------
 # 4) GET DOCS/{id}
 # -----------------------
-# Ganti fungsi get_doc di backend/routes/agent.py dengan kode berikut
+
+# @router.get("/docs/{id}")
+# async def get_doc(id: str):
+#     """
+#     Return document metadata and small stats from Postgres.
+#     Uses postgres_conn.get_document which returns a plain dict (no ORM objects).
+#     """
+#     db = postgres_conn.SessionLocal()
+#     try:
+#         doc = postgres_conn.get_document(db, id)
+#         if not doc:
+#             raise HTTPException(status_code=404, detail="Document not found")
+#         return doc
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         logger.exception("Error in /agent/docs/{id}: %s", e)
+#         raise HTTPException(status_code=500, detail=str(e))
+#     finally:
+#         db.close()
 
 @router.get("/docs/{id}")
-async def get_doc(id: str):
+async def get_doc(id: str, question: str = Query(None), top_k: int = Query(3, ge=1, le=10)):
     """
-    Return document metadata and small stats from Postgres.
-    Uses postgres_conn.get_document which returns a plain dict (no ORM objects).
+    Return document metadata and chunks.
+    Optional query params:
+      - question (string): if provided, retrieve top_k relevant chunks (via retriever) and produce highlights.
+      - top_k (int): number of top chunks to retrieve when question provided (default 3)
+
+    Response structure:
+    {
+      "doc_id": "...",
+      "filename": "...",
+      "uploaded_at": "...",
+      "status": "...",
+      "num_chunks": N,
+      "metadata": {...} or null,
+      "chunks": [  # ALL chunks if no question; otherwise top_k chunks
+         {
+           "chunk_id": "...",
+           "text": "...",
+           "source": "...",
+           "origin_meta": {...},
+           "indexed": true/false,
+           // when question provided, optionally:
+           "score": 0.123,            # if vector_store returned a score
+           "highlights": [
+               {"snippet": "...", "start": 123, "end": 145}
+           ]
+         },
+         ...
+      ],
+      "question_context": { ... }  # when question provided: prompt, answer not included here
+    }
     """
     db = postgres_conn.SessionLocal()
     try:
+        # 1) fetch document metadata (primitive dict)
         doc = postgres_conn.get_document(db, id)
         if not doc:
             raise HTTPException(status_code=404, detail="Document not found")
-        return doc
+
+        # helper to load chunks (all chunks) as list of dicts
+        all_chunks = postgres_conn.get_chunks_by_doc_id(db, id)
+
+        # if no question -> return metadata + (optionally) all chunks (without highlights)
+        if not question:
+            # return metadata + all chunk summaries (no heavy ops)
+            return {
+                "doc_id": doc["id"],
+                "filename": doc["filename"],
+                "uploaded_at": doc["uploaded_at"],
+                "status": doc["status"],
+                "num_chunks": doc["num_chunks"],
+                "metadata": doc["metadata"],
+                "chunks": all_chunks,
+            }
+
+        # 2) question provided -> use retriever to get top_k contexts + details
+        # retrieve_and_build_prompt returns (prompt, context_texts, search_results)
+        prompt, context_texts, search_results = await retrieve_and_build_prompt(id, question, top_k=top_k)
+
+        # 3) Build detailed chunk objects: combine search_result metadata + chunk text
+        # search_results are normalized by vector_store.search_similar to include "id", "score", "metadata", "document"
+        top_chunks = []
+        for idx, res in enumerate(search_results):
+            # find the chunk text: prefer 'document' field; fallback to context_texts
+            text = None
+            if isinstance(res, dict):
+                text = res.get("document") or (context_texts[idx] if idx < len(context_texts) else None)
+            if text is None:
+                text = context_texts[idx] if idx < len(context_texts) else ""
+
+            # metadata and score
+            metadata = res.get("metadata") if isinstance(res, dict) else None
+            score = res.get("score") if isinstance(res, dict) else None
+            chunk_id = metadata.get("chunk_id") if isinstance(metadata, dict) and metadata.get("chunk_id") else (res.get("id") if isinstance(res, dict) else None)
+
+            # generate lightweight highlights from question -> snippet(s)
+            highlights = _extract_highlights_simple(question, text, max_snippets=2)
+
+            top_chunks.append({
+                "chunk_id": chunk_id,
+                "text": text,
+                "source": metadata.get("source") if isinstance(metadata, dict) else None,
+                "origin_meta": metadata if isinstance(metadata, dict) else None,
+                "score": score,
+                "highlights": highlights,
+            })
+
+        # 4) optional: include all chunks (full list) but mark which ones were returned as top-k
+        # Build a map of top chunk_ids for quick flagging
+        top_ids = {c["chunk_id"] for c in top_chunks if c.get("chunk_id")}
+        all_chunks_flagged = []
+        for c in all_chunks:
+            c_copy = dict(c)
+            c_copy["is_top"] = c_copy.get("chunk_id") in top_ids
+            # don't attach heavy highlights for non-top chunks
+            all_chunks_flagged.append(c_copy)
+
+        return {
+            "doc_id": doc["id"],
+            "filename": doc["filename"],
+            "uploaded_at": doc["uploaded_at"],
+            "status": doc["status"],
+            "num_chunks": doc["num_chunks"],
+            "metadata": doc["metadata"],
+            "top_chunks": top_chunks,
+            "chunks": all_chunks_flagged,
+            "prompt": prompt,
+            # note: answering is done in /agent/chat, so /docs/{id}?question=... only shows context & highlights
+        }
+
     except HTTPException:
         raise
     except Exception as e:
@@ -315,4 +432,77 @@ async def get_doc(id: str):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
+
+
+# ---------------------------
+# highlight helper function
+# ---------------------------
+def _extract_highlights_simple(question: str, text: str, max_snippets: int = 2) -> List[Dict[str, Any]]:
+    """
+    Heuristic highlight extractor:
+      - split text into sentences (simple split on punctuation/newlines)
+      - score each sentence by number of overlapping normalized words with the question
+      - return top `max_snippets` sentences with start/end char positions and snippet text
+
+    This is fast and dependency-free. For better quality use NLP models / token overlap / attention-based spans.
+    """
+    import re
+    from collections import Counter
+
+    def _normalize(s: str) -> List[str]:
+        # lowercase + keep word characters
+        return re.findall(r"\w+", s.lower())
+
+    q_tokens = _normalize(question)
+    if not q_tokens:
+        return []
+
+    q_counter = Counter(q_tokens)
+
+    # split into sentences/segments
+    # split on .,!? or newline; keep segments reasonable
+    raw_segments = re.split(r'(?<=[\\.\\!\\?\\n])\\s+', text)
+    scored = []
+    for seg in raw_segments:
+        seg_norm = _normalize(seg)
+        if not seg_norm:
+            continue
+        # score = number of shared tokens (could weight by frequency)
+        shared = sum(min(q_counter[t], seg_norm.count(t)) for t in set(seg_norm) if t in q_counter)
+        if shared > 0:
+            scored.append((shared, seg.strip(), seg))
+
+    # sort by score desc and length short-first as tiebreaker
+    scored.sort(key=lambda x: (-x[0], len(x[1])))
+
+    highlights = []
+    used_ranges = []
+    for score, seg_display, seg_original in scored[:max_snippets]:
+        # find first occurrence index of segment in text (raw)
+        start = text.find(seg_original)
+        if start == -1:
+            # fallback: try lowercase search
+            start = text.lower().find(seg_original.lower())
+        if start == -1:
+            # give up locating indices; return snippet without indices
+            highlights.append({"snippet": seg_display, "start": None, "end": None})
+        else:
+            end = start + len(seg_original)
+            # avoid overlapping snippets (simple check)
+            overlap = False
+            for (s, e) in used_ranges:
+                if not (end <= s or start >= e):
+                    overlap = True
+                    break
+            if overlap:
+                continue
+            used_ranges.append((start, end))
+            highlights.append({"snippet": seg_display, "start": start, "end": end})
+
+    # If nothing scored (no token overlap), include the beginning of text as fallback
+    if not highlights and text:
+        snippet = text[:200].strip()
+        highlights.append({"snippet": snippet, "start": 0, "end": min(len(text), 200)})
+
+    return highlights
 

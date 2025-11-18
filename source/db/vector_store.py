@@ -2,9 +2,10 @@
 
 import os
 import typing
+from settings import settings
 from typing import List, Dict, Any, Optional
 
-VECTOR_DB = os.getenv("VECTOR_DB", "chroma").strip().lower()
+VECTOR_DB = settings.VECTOR_DB.strip().lower()
 
 # --- Chromadb imports (optional) ---
 chromadb = None
@@ -131,13 +132,13 @@ def search_similar(query_embedding: List[float], top_k: int = 3, collection_name
     """
     Search for top_k similar vectors to the provided query_embedding.
 
-    Returns list of dicts with keys:
-      - "id": vector id
-      - "score": similarity score/distance (as returned by chroma)
-      - "document": the stored document/text
-      - "metadata": stored metadata dict
+    This function is resilient to several chromadb client signatures:
+      - collection.query(embedding=..., n_results=..., include=[...])
+      - collection.query(query_embeddings=[...], n_results=..., include=[...])
+      - collection.query(queries=[...], n_results=..., include=[...])
 
-    For VECTOR_DB = faiss: raises RuntimeError("penyimpanan belum tersedia")
+    It normalizes the returned structure into a list of dicts:
+      [{"id": ..., "score": ..., "metadata": ..., "document": ...}, ...]
     """
     if VECTOR_DB == "faiss":
         raise RuntimeError("penyimpanan belum tersedia")
@@ -147,41 +148,74 @@ def search_similar(query_embedding: List[float], top_k: int = 3, collection_name
 
     _ensure_chroma()
     client = _get_chroma_client()
-    # if collection_name not provided, search across all collections is not supported here;
-    # require collection name to be provided in multi-doc setups. Default to 'default' collection?
     coll_name = collection_name
     if not coll_name:
-        # default behavior: search across all collections named 'docs_*' is expensive; attempt to use 'default'
-        # but safer is to raise so caller thinks about collection scope.
         raise ValueError("collection_name must be provided for search_similar (e.g. 'docs_<doc_id>')")
 
     try:
         collection = client.get_collection(name=coll_name)
-    except Exception as e:
-        # collection missing -> return empty
+    except Exception:
+        # collection missing -> return empty list
         return []
 
-    # Query chroma
-    # include distances, metadatas, documents, ids
-    query_res = collection.query(embedding=query_embedding, n_results=top_k, include=["metadatas", "documents", "distances", "ids"])
+    include = ["metadatas", "documents", "distances", "ids"]
 
-    # chroma returns dicts of lists; normalize into list of results
-    ids = query_res.get("ids", [])
-    distances = query_res.get("distances", [])
-    metadatas = query_res.get("metadatas", [])
-    documents = query_res.get("documents", [])
+    query_res = None
+    last_exc = None
+
+    # Try several possible query signatures that different chroma versions use
+    try:
+        query_res = collection.query(embedding=query_embedding, n_results=top_k, include=include)
+    except TypeError as e:
+        last_exc = e
+        try:
+            # some versions accept 'query_embeddings' as list of embeddings
+            query_res = collection.query(query_embeddings=[query_embedding], n_results=top_k, include=include)
+        except TypeError as e2:
+            last_exc = e2
+            try:
+                # some versions accept 'queries' key
+                query_res = collection.query(queries=[query_embedding], n_results=top_k, include=include)
+            except Exception as e3:
+                last_exc = e3
+
+    if query_res is None:
+        # If none worked, raise a helpful error with underlying exception message
+        raise RuntimeError(f"Vector store search error: {last_exc}")
+
+    # Normalize response structures from chroma into lists
+    # Typical shape from chroma: dict with lists (possibly nested): ids, distances, metadatas, documents
+    ids = query_res.get("ids") if isinstance(query_res, dict) else None
+    distances = query_res.get("distances") if isinstance(query_res, dict) else None
+    metadatas = query_res.get("metadatas") if isinstance(query_res, dict) else None
+    documents = query_res.get("documents") if isinstance(query_res, dict) else None
+
+    # If nested (queries was list), select first result
+    if ids and isinstance(ids[0], list):
+        ids = ids[0]
+    if distances and isinstance(distances[0], list):
+        distances = distances[0]
+    if metadatas and isinstance(metadatas[0], list):
+        metadatas = metadatas[0]
+    if documents and isinstance(documents[0], list):
+        documents = documents[0]
+
+    # Fallback: chroma may sometimes return results in different keys; try alternate keys
+    if ids is None and isinstance(query_res, dict):
+        # try 'result' key or similar
+        # flatten any list-like values if necessary
+        ids = query_res.get("result_ids") or query_res.get("ids", [])
+        distances = distances or query_res.get("result_distances") or query_res.get("distances", [])
+        metadatas = metadatas or query_res.get("result_metadatas") or query_res.get("metadatas", [])
+        documents = documents or query_res.get("result_documents") or query_res.get("documents", [])
+
+    # Ensure lists
+    ids = ids or []
+    distances = distances or []
+    metadatas = metadatas or []
+    documents = documents or []
 
     results: List[Dict[str, Any]] = []
-    # ids/distances/metadatas/documents can be nested lists if multiple queries were done;
-    # but since we query a single vector, they should be lists at top-level.
-    # However handle both possibilities:
-    if ids and isinstance(ids[0], list):
-        # nested form, take first query result
-        ids = ids[0]
-        distances = distances[0] if distances and isinstance(distances[0], list) else distances
-        metadatas = metadatas[0] if metadatas and isinstance(metadatas[0], list) else metadatas
-        documents = documents[0] if documents and isinstance(documents[0], list) else documents
-
     for i, vec_id in enumerate(ids):
         res = {
             "id": vec_id,
@@ -192,3 +226,4 @@ def search_similar(query_embedding: List[float], top_k: int = 3, collection_name
         results.append(res)
 
     return results
+
