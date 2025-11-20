@@ -1,7 +1,7 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class MasterSettings(BaseSettings):
+class Settings(BaseSettings):
     # AGENT
     LLM_API_KEY: str
     LLM_BASE_URL: str
@@ -27,7 +27,7 @@ class MasterSettings(BaseSettings):
     )
 
 
-settings = MasterSettings()
+settings = Settings()
 
 
 __all__ = ["settings"]

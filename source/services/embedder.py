@@ -19,16 +19,13 @@ Dependencies: httpx
 from typing import List, Dict, Any, Optional
 import os
 import logging
-
+from settings import settings
 import httpx
 
 logger = logging.getLogger(__name__)
 
 # try import settings if present
-try:
-    from settings import EMBEDDING_BASE_URL
-except Exception:
-    EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL")
+EMBEDDING_BASE_URL = settings.EMBEDDING_BASE_URL
 
 # default model
 EMBED_MODEL = os.getenv("EMBED_MODEL", "ebbge-m3")

@@ -6,6 +6,7 @@ from typing import List, Dict, Any, Optional
 
 from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks, Query, Form
 from loguru import logger
+from settings import settings
 
 # extractor, retriever, llm client
 from services.extractor import extract_and_chunk
@@ -166,7 +167,7 @@ async def index_document(
                 set_job_status(job_id_inner, {"status": "running", "doc_id": doc_id_inner, "total_chunks": len(chunks)})
 
                 # embed chunks
-                embedding_url = os.getenv("EMBEDDING_BASE_URL")
+                embedding_url = settings.EMBEDDING_BASE_URL
                 if not embedding_url:
                     raise RuntimeError("EMBEDDING_BASE_URL is not set")
 

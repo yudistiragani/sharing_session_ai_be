@@ -5,6 +5,7 @@ import os
 import logging
 import json
 import httpx
+from settings import settings
 
 logger = logging.getLogger(__name__)
 
@@ -18,11 +19,8 @@ except Exception:
 
 
 # ENV / settings
-try:
-    from settings import LLM_API_KEY, LLM_BASE_URL
-except Exception:
-    LLM_API_KEY = os.getenv("LLM_API_KEY")
-    LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://1.2.3.4:8787/v1")
+LLM_API_KEY = settings.LLM_API_KEY
+LLM_BASE_URL = settings.LLM_BASE_URL
 
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-oss-20b")
 HTTP_TIMEOUT = float(os.getenv("LLM_HTTP_TIMEOUT", "30"))
